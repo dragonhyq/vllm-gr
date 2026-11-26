@@ -153,22 +153,34 @@ def _paged_attention(
             raise ValueError("Invalid MLU paged attention sequence length")
         if end == start or length == 0:
             continue
-        q_lens = torch.tensor([0, end - start], device=query.device, dtype=torch.int32)
-        k_lens = torch.tensor([0, length], device=query.device, dtype=torch.int32)
-        out, state = _flash(
-            query[start:end],
-            key,
-            value,
-            q_lens,
-            k_lens,
-            end - start,
-            length,
-            scale,
-            causal,
-            block_table[index : index + 1],
-        )
-        result[start:end].copy_(out)
-        lse[:, start:end].copy_(state)
+        query_length = end - start
+        if causal and query_length > length:
+            raise ValueError("Causal MLU prefill requires a KV slot for every query")
+        # A cached prefill can omit whole KV pages. Give each causal query
+        # page the same TMO geometry as that page had during an uncached
+        # forward, including the bottom-right alignment of a partial page.
+        pos = start
+        while pos < end:
+            cached = length - (end - pos)
+            count = min(end - pos, key.shape[2] - cached % key.shape[2]) if causal else end - pos
+            visible = cached + count if causal else length
+            q_lens = torch.tensor([0, count], device=query.device, dtype=torch.int32)
+            k_lens = torch.tensor([0, visible], device=query.device, dtype=torch.int32)
+            out, state = _flash(
+                query[pos : pos + count],
+                key,
+                value,
+                q_lens,
+                k_lens,
+                count,
+                visible,
+                scale,
+                causal,
+                block_table[index : index + 1],
+            )
+            result[pos : pos + count].copy_(out)
+            lse[:, pos : pos + count].copy_(state)
+            pos += count
     return result, lse
 
 

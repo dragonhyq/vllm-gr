@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
 from vllm_gr.ops.npu.unconstrained_topk import select_unconstrained_candidates
@@ -35,6 +36,33 @@ from vllm_gr.v1.beam.dispatch import (
     validate_dispatch_session,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+
+
+class _PrefillMatmulMode(TorchDispatchMode):
+    """Use the same CNNL reduction for a prompt row on cache hits and misses."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.matmul = torch.ops.torch_mlu_ops.matmul_aot_inductor.default
+        self.arg_names = tuple(arg.name for arg in self.matmul._schema.arguments)
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is self.matmul:
+            named = dict(zip(self.arg_names, args))
+            named.update(kwargs or {})
+            a, b = named["a"], named["b"]
+            # TMO supports invariant 2D floating-point products without
+            # activation fusion or a transpose of the left operand.
+            if (
+                a.ndim == b.ndim == 2
+                and a.dtype in (torch.float16, torch.bfloat16)
+                and b.dtype == a.dtype
+                and not named["trans_a"]
+                and named["act_mode"] == "none"
+            ):
+                named["batch_invariant"] = True
+                return func(**named)
+        return func(*args, **(kwargs or {}))
 
 
 @dataclass
@@ -239,7 +267,8 @@ class MLUEagerBeamStageRunner:
         self.pending = metadata
         try:
             if metadata.kind is GRStageKind.PREFILL:
-                result = original(self.worker, local, *args, **kwargs)
+                with _PrefillMatmulMode():
+                    result = original(self.worker, local, *args, **kwargs)
                 native = self.worker.execute_model_state
                 if result is not None or native is None or native.hidden_states is None:
                     raise RuntimeError("MLU Prefill did not publish native hidden states")

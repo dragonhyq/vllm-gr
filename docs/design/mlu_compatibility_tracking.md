@@ -1063,6 +1063,33 @@ entries does not make that existing restriction pass.
 - Packaging accepts the MLU target and records the MLU version suffix. Package
   installation and provider discovery do not demonstrate execution support.
 
+## Eager prefix-cache repeatability
+
+A prefix cache hit changes the number of prompt rows in the native forward.
+The MLU eager Beam runner enables TMO's batch-invariant matrix multiplication
+during prefill. Causal paged attention processes query pages with their visible
+KV lengths so a cached suffix uses the same launch geometry as the
+corresponding pages of a full prompt. The latter change adds attention
+launches for longer uncached prompts.
+
+On OneRec-1.7B BF16, MLU590-M9DK, runner V2, width 128 and eager execution,
+the three comparison prompts returned identical ordered token sequences across
+three requests each. Six additional histories of 15 through 279 prompt tokens
+also repeated exactly. Two prompts matched when a different request populated
+their shared prefix. Run the regression against a server with prefix caching enabled:
+
+```bash
+python tests/system/check_mlu_beam_repeatability.py --base-url "$BASE_URL" --model "$MODEL"
+```
+
+Exact CUDA ranking is still open. On the original three prompts the H20-3e
+reference and MLU agreed on 8/128, 24/128 and 13/128 ranked positions,
+respectively. All three top recommendations matched. Replaying the H20 logits
+through the MLU candidate selector and Beam state reproduced all 384 ordered
+recommendations. The native model forward already differs in the first QKV
+projection on identical BF16 operands. These measurements use vLLM 0.30.0
+on CUDA and 0.33.0+mlu0.17.0.pt214 on MLU.
+
 ## Updating this record
 
 After each startup fix, record the new failure boundary and update only the
