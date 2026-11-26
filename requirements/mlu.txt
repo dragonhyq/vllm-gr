@@ -1,0 +1,3 @@
+# The MLU runtime (vLLM, vLLM-MLU, Torch, and vendor libraries) is supplied
+# by the prepared vendor environment. Preserve its NumPy/OpenCV packages.
+-r common.txt

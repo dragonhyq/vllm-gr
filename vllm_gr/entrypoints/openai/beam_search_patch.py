@@ -8,6 +8,8 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from vllm.inputs import EngineInput
     from vllm.lora.request import LoRARequest
     from vllm.outputs import RequestOutput
@@ -31,6 +33,7 @@ def beam_search_dispatch(
     session_id: str | None = None,
     *,
     trie_ids: list[int] | tuple[int, ...] | None = None,
+    priority: int | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
     """Route upstream OpenAI Beam calls exclusively to GR V1.
 
@@ -47,7 +50,14 @@ def beam_search_dispatch(
     from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
     require_beam_config(getattr(self.engine_client, "vllm_config", None))
-    trie_kwargs = {} if trie_ids is None else {"trie_ids": trie_ids}
+    request_kwargs: dict[str, Any] = {} if trie_ids is None else {"trie_ids": trie_ids}
+    if priority is not None:
+        from vllm.platforms import current_platform
+
+        if current_platform.device_type != "mlu":
+            raise TypeError("Explicit Beam request priority is only supported by the MLU adapter")
+        # Native MLU vLLM 0.33 forwards priority even when it is zero.
+        request_kwargs["priority"] = priority
     return beam_search(
         self,
         prompt=prompt,
@@ -56,7 +66,7 @@ def beam_search_dispatch(
         lora_request=lora_request,
         trace_headers=trace_headers,
         session_id=session_id,
-        **trie_kwargs,
+        **request_kwargs,
     )
 
 

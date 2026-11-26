@@ -28,6 +28,10 @@ Scope: `core`; backend ID: `null`
 An explicit CUSTOM choice, including one restored from serialized GR
 configuration, must reach the registered Beam backend. Changes to the private
 attention selector or its cache can silently select a different backend.
+On MLU, the wrapper accepts the vLLM 0.33 `_run_kv_cache_dtype` keyword and
+forwards it unchanged to the cached native fallback selector. CUDA/NPU keep
+their existing signature. CUSTOM selection bypasses the native selector as
+before, retaining any GR backend import or implementation error.
 
 ## GR-PATCH-002 — NPUWorker Initialization Hook
 
@@ -58,6 +62,14 @@ ranked candidates for the OpenAI-compatible API. The wrapper depends on the
 native serving and protocol methods it replaces. The patch validates the Chat
 and Completion sampling methods and the Completion `vllm_xargs` schema for
 integer lists. A missing binding or a mismatched schema triggers reinstallation.
+
+The MLU vLLM 0.33 serving caller passes `priority`, including the default zero.
+The dispatcher accepts an explicit priority only on MLU and forwards it through
+the online request to native input processing. The grouped completion adapter
+uses the same native header/body priority resolver as single-prompt serving.
+An omitted priority retains GR's arrival-based value, preserving existing
+CUDA/NPU calls. Argument forwarding does not establish priority scheduling:
+GR's Beam batch ownership policy remains arrival ordered.
 
 ## GR-PATCH-005 — EngineArgs Configuration Override
 
@@ -99,6 +111,18 @@ Scheduling attaches Beam stage and retirement metadata to native scheduler
 outputs. Logical token accounting and outstanding worker receipts must agree
 before the next owner can be admitted.
 
+The installer and validator accept an optional explicit `scheduler_cls` for
+provider-owned overrides. Calls without it retain the upstream module target
+used by CUDA/NPU. Both paths use the same admission, prompt-cache guard, stage
+metadata, completion and retirement logic. Nested wrappers must execute these
+operations once while retaining the vendor `super().schedule()` chain.
+
+Admission defaults to the native `waiting` and `skipped_waiting` queues. A
+provider can install `_gr_admission_queue_context(owner_ids)` on its scheduler
+class to filter a different queue layout. The context must preserve native
+ordering and mutations and restore the original collections on exceptions.
+Owner selection, KV reservation and stage backpressure remain shared.
+
 ## GR-PATCH-022 — Prefix-cache hash memoization
 
 Scope: `core`; backend ID: `null`
@@ -106,6 +130,19 @@ Scope: `core`; backend ID: `null`
 Bounded per-process memoization avoids hashing identical prefix blocks and
 prompts repeatedly. Reinstallation checks the wrappers and the EngineCore
 binding that constructs the hasher.
+
+On MLU, the factory accepts and forwards vLLM 0.33's optional
+`num_hash_lookahead_tokens`. Nonzero lookahead returns the native request hasher
+because GR's whole-chain memo omits the following tokens and would emit hashes
+before those tokens exist. Zero lookahead retains the shared chain memo;
+CUDA/NPU retain their two-argument factory and native calls. The patch markers,
+memo diagnostics and EngineCore binding still identify the installed factory.
+
+The native request hasher continues to call the patched per-block hash function.
+Its lookahead extra keys participate in that function's digest and memo key,
+but GR's SHA-256 encoding is not stock vLLM serialization. This adaptation
+does not establish external-cache interoperability or speculative decoding
+support. See [MLU compatibility tracking](../mlu_compatibility_tracking.md).
 
 ## GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
 
@@ -138,6 +175,16 @@ Scope: `core`; backend ID: `null`
 GR registers Beam attention in the upstream CUSTOM slot. Registration and the
 selector have separate responsibilities. Another extension claiming that slot
 can invalidate the selection.
+
+On MLU, the provider supplies the eager `beam_attn_mlu` execution module. Its
+cache views match native TMO's per-head K/V packing in contiguous LBHNC storage;
+using the facade's CUDA/NPU token-interleaved views would read different cache
+locations. The facade restricts MLU to that layout and disables quantized query
+input. Existing TMO cache-write and flash-attention operations, the vendor
+attention-state merge, and shared eager suffix writes implement attention
+without new kernels. This covers one Beam session per dispatch, not the missing
+MLU runner stage execution. Graph capture and unsupported attention features
+raise explicitly; see [MLU compatibility tracking](../mlu_compatibility_tracking.md).
 
 ## GR-PATCH-015 — Sliced Vocabulary Projection
 
@@ -183,6 +230,151 @@ lets eligible Ascend xllm Beam layers request contiguous prefix K/V at native
 allocation. Attention row selection is a separate reader (`select_beam_rows`)
 that checks layout, strides and format before using the paged block table.
 An unsuitable layout keeps the gather path.
+
+## GR-PATCH-023 - MLU V2 Runner Lifecycle and Eager Beam
+
+Scope: `backend`; backend ID: `mlu`
+
+The deferred MLU Worker hook installs lifecycle routing on the vendor V2
+runner. Its execute/sample wrappers route nonempty GR stage metadata to the
+[eager MLU adapter](../../../vllm_gr/v1/worker/mlu/beam_stage_runner.py), route
+retirement separately, and preserve native execution for ordinary/empty
+frames. Legacy frames remain rejected. An execute failure must also reach
+sampling; native logits from an earlier request must never mask it.
+
+Validate shared dispatch identity, ordering, counts and the admitted execution
+scope before model work. Prefill uses native forward, consumes its hidden-state
+handoff, and advances the native computed-token counter exactly once. Decode
+retains native request/KV bookkeeping but runs physical Beam rows through the
+existing MLU attention adapter. Shared pool objects hold suffix KV. Candidate
+selection uses the existing Torch-only unconstrained implementation; stable
+score order determines survivors, then stable parent grouping defines the next
+row order. Reorder suffix KV using separate gathered tensors before overwriting.
+
+Decode also supplies vendor `MLUCommonAttentionMetadata` alongside the per-layer
+Beam metadata. Common query offsets describe one token per physical Beam row;
+sequence lengths include the prefix and current suffix, with Decode-only mode.
+The repeated block table describes the shared native prefix and slots remain
+PAD slots. This common object serves vendor forward-context consumers; it is
+not a native paged-attention plan for the suffix, which stays in GR pools.
+Native attention fallback and parallel consumers require separate adaptation.
+Decode position tensors inherit dtype and device from the native MLU position
+buffer, keeping the vendor rotary-embedding input contract.
+
+Return shared worker receipts and validated terminal result schemas. Finish
+current-stream device work before acknowledging resource release. Explicit
+retirement requires the matching drained owner/generation and caches duplicate
+receipts. Reload/shutdown close the owned buffers. The initial scope is one
+prompt, fixed widths, FP16/BF16 unquantized KV, a plain decoder, async V2,
+TP/PP/DP/CP=1, unconstrained candidates, ignored stop tokens and eager mode.
+Graphs, constraints, dynamic widths and multiple prompts remain rejected.
+Host dispatch copying, synchronous terminal copies and on-demand suffix pool
+allocation are deliberate initial costs; performance and memory budgeting
+require later work. Runtime integration remains subject to the tracking record.
+
+## GR-PATCH-024 - MLU additional_config Filter
+
+Scope: `backend`; backend ID: `mlu`
+
+The [MLU configuration patch](../../../vllm_gr/platforms/mlu/config_patch.py)
+follows the Ascend scoped-filter approach. Native `init_mlu_config` receives
+the same engine config with GR transport keys temporarily excluded from
+`additional_config`. A `finally` block restores the original mapping, including
+the serialized backend plan, even if vendor validation fails. Only reserved GR
+keys are filtered; other unknown fields remain subject to native validation.
+The MLU provider installs this wrapper during runtime initialization. Native
+worker plugin loading installs it before worker construction in a fresh process.
+Current MLU platform, EngineCore and Worker callers import the function locally;
+future module-global aliases or earlier config initialization need reassessment.
+
+## GR-PATCH-025 - MLU EngineCore Startup Order
+
+Scope: `backend`; backend ID: `mlu`
+
+The [MLU process entry](../../../vllm_gr/platforms/mlu/engine_core_patch.py)
+is installed by the provider's configuration service after native configuration,
+following the Ascend entrypoint pattern. It must remain module-level so spawn
+can import it independently of the parent's patched class state.
+
+In the child, install the vendor config filter, import `vllm_mlu.mlu_hijack`,
+complete general-plugin loading, then install and validate the shared GR child
+plan and the selected MLU scheduler (GR-PATCH-027). Before delegating directly to
+`EngineCoreProc_MluHijack.run_engine_core`,
+verify that unwrapping `EngineCore.__init__` reaches the vendor initializer.
+The vendor entrypoint's subsequent plugin-loading call is already satisfied.
+The initializer is executed once by normal engine construction, preserving
+vendor state and GR post-load readiness work.
+
+Importing the vendor patches before general plugins avoids dependence on their
+enumeration order. Installing GR after plugin loading repairs any overwritten
+child methods. Repeated configuration finalization reasserts the dedicated
+entrypoint. CUDA and NPU do not select this service. This adapter depends on
+private vendor names and their saved native entrypoint; changes to vendor
+startup or additional plugins that replace initialization need reassessment.
+
+## GR-PATCH-026 - MLU NumPy Token Staging
+
+Scope: `backend`; backend ID: `mlu`
+
+The [MLU staging adapter](../../../vllm_gr/v1/worker/mlu/numpy_staging.py)
+reuses CUDA's NumPy contents and transfer wrappers after native vendor imports.
+Installation occurs inside the deferred MLU runner installer before native
+ModelRunner construction. Other platform installers do not select this adapter.
+
+NumPy arrays use an explicit empty-size check and retain bulk collection.
+Successful nonempty array staging must update `_staged_write_max_len`: native
+vLLM 0.33 uses it to launch every 1024-element write chunk. Without this update,
+the older CUDA adapter silently truncates long writes on the multi-row path.
+Native list and scalar writes already maintain the field; native clearing
+resets it. Invalid arrays must not queue writes. Read-only inputs and existing
+transfer output buffers retain the shared adapter's semantics.
+
+The patch leaves vendor `apply_write`, fused `apply`, buffer-pool implementations
+and device kernels in place. Repeated installation is idempotent; validation
+checks both the stage wrapper and its captured transfer binding. An existing
+NumPy wrapper with an unexpected or replaced binding raises instead of nesting
+another owner. This does not validate concurrent streams, graphs, model-level
+token ownership or Beam execution. Native buffer-layout and write-contract
+changes require reassessment when the vendor runtime changes.
+
+## GR-PATCH-027 - MLU Selected Scheduler Beam Dispatch
+
+Scope: `backend`; backend ID: `mlu`
+
+MLU selects a separate vendor `AsyncScheduler` whose inherited
+`SchedulerWithProfiler.schedule()` does not delegate to the upstream method.
+The [MLU installer](../../../vllm_gr/platforms/mlu/scheduler_patch.py) resolves
+the class through `config.scheduler_config.get_scheduler_cls()` and supplies
+that class to the shared GR installer and validator. The shared wrapper retains
+the original vendor algorithm and forwards `throttle_prefills`; existing
+inherited GR hooks are not wrapped twice.
+
+Install during MLU configuration finalization for the parent/in-process path,
+and reassert in the spawned child after vendor plugins and the common GR plan.
+The validator checks the configured class, not just the upstream scheduler.
+Only the standard vendor `AsyncScheduler` is admitted for Beam; an unrelated
+or custom scheduler is rejected. Non-Beam configurations are unchanged.
+
+The installer also binds and validates `mlu_admission_queues` as the class's
+`_gr_admission_queue_context`. During an owned scheduling pass, both `waiting`
+and `kv_holding_waiting` expose only that owner's requests through the shared
+queue view. Native scheduling retains its KV-holder-first scan, FCFS/priority
+ordering and per-step skipped-request requeue operations. A filtered view of
+`deferred_waiting` keeps counts consistent with the visible queues while
+writing additions/removals to the original set. It is bookkeeping, not a third
+selection queue. Restore all three collection identities after success or
+failure, retaining native changes. Do not create a synthetic `skipped_waiting`.
+
+The queue hook is installed only on the selected MLU class; CUDA/NPU retain the
+default queue context. Repeated installation repairs a missing/replaced hook
+without nesting the schedule wrapper. No-session calls bypass queue filtering.
+Future native operations on the deferred set or queue types require review.
+
+This installs Beam admission, prompt-cache protection, stage metadata and
+retirement dispatch. It does not supply the missing MLU worker Beam stages.
+Validation must distinguish metadata reaching the worker from successful Beam
+execution. Native scheduler API changes, alternative launch paths, parallel
+execution, completion and retirement still require runtime validation.
 
 ## Retired patches
 

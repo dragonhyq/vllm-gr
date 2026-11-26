@@ -111,9 +111,12 @@ def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
     scheduler_cls.reset_prefix_cache = patched_reset_prefix_cache
 
 
-def apply_scheduler_patch():
-    """Install the native scheduler hooks for Beam dispatch and completion."""
-    from vllm.v1.core.sched.scheduler import Scheduler
+def apply_scheduler_patch(*, scheduler_cls=None):
+    """Install Beam hooks on the native base or an explicit vendor scheduler."""
+    if scheduler_cls is None:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    else:
+        Scheduler = scheduler_cls
 
     from vllm_gr.v1.beam.batch_contracts import GRAdmissionError
     from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
@@ -556,8 +559,11 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
     scheduler_cls.update_from_output = patched_update_from_output
 
 
-def validate_scheduler_patch() -> str | None:
-    from vllm.v1.core.sched.scheduler import Scheduler
+def validate_scheduler_patch(*, scheduler_cls=None) -> str | None:
+    if scheduler_cls is None:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    else:
+        Scheduler = scheduler_cls
 
     if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False) and getattr(
         Scheduler.update_from_output, _SCHEDULER_UPDATE_PATCH_MARKER, False

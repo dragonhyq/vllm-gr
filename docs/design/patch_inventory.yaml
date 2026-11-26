@@ -36,7 +36,7 @@ patches:
     backend_id: null
     owner: vllm_gr/v1/attention/selector_patch.py
     installer: vllm_gr.v1.attention.selector_patch.apply_custom_attention_backend_patch
-    activation: the vLLM attention selector is importable and the wrapper is not installed
+    activation: the vLLM attention selector is importable and the wrapper is not installed; MLU selects the vLLM 0.33 keyword-aware wrapper while CUDA and NPU retain the existing signature
     validator_or_test:
       - tests/v1/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
       - tests/v1/test_ascend_compat.py::test_selector_reinstalls_over_replaced_upstream_target
@@ -95,7 +95,7 @@ patches:
     process_roles: [api_server]
     target: GenerateBaseServing.beam_search, ChatCompletionRequest/CompletionRequest.to_beam_search_params, and CompletionRequest.model_fields["vllm_xargs"]
     risk: high
-    contract: beam_search adapts upstream callers exclusively to the GR implementation
+    contract: beam_search adapts upstream callers exclusively to the GR implementation; on MLU it preserves the native vLLM 0.33 priority argument in the online request, including zero
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points
 
   - id: GR-PATCH-005
@@ -176,7 +176,7 @@ patches:
     owner: vllm_gr/v1/core/sched/scheduler_patch.py and beam_async_scheduler.py
     shared_helpers: vllm_gr/v1/core/sched/beam_session.py, vllm_gr/v1/beam/dispatch.py
     installer: vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch
-    activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper
+    activation: the EngineCore patch plan detects a missing base wrapper; providers may explicitly select a vendor scheduler class through the same installer and validator
     validator_or_test:
       - vllm_gr.v1.core.sched.scheduler_patch.validate_scheduler_patch
       - tests/v1/engine/test_gr_async_scheduler.py
@@ -202,6 +202,7 @@ patches:
     target: vllm.v1.core.kv_cache_utils.hash_block_tokens and get_request_block_hasher, plus vllm.v1.engine.core.get_request_block_hasher
     risk: high
     contract: prefix-cache-hash-equivalence
+    execution: MLU forwards vLLM 0.33 lookahead to the native factory and bypasses the whole-chain memo for nonzero lookahead; CUDA/NPU retain two-argument factories; per-block hashing remains patched
     removal_condition: upstream provides equivalent prefix hashing for repeated prompts
 
   - id: GR-PATCH-011
@@ -296,6 +297,7 @@ patches:
       metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata
       gpu_execution: vllm_gr.v1.attention.backends.beam_attn_gpu
       npu_execution: vllm_gr.v1.attention.backends.beam_attn_npu
+      mlu_execution: vllm_gr.v1.attention.backends.beam_attn_mlu
       backend_registration_and_facade: vllm_gr.v1.attention.backends.beam_attn
       compatibility_exports:
         - BeamAttentionMetadata
@@ -382,6 +384,80 @@ patches:
     risk: high
     contract: npu-contiguous-prefix-kv-allocation
     removal_condition: Ascend exposes a backend contiguous-KV capability covering GR xllm without a native policy bridge
+
+  - id: GR-PATCH-023
+    scope: backend
+    backend_id: mlu
+    owner: vllm_gr/v1/worker/mlu/runner_installer.py and model_runner_patch.py
+    shared_helpers: vllm_gr/v1/worker/mlu/beam_stage_runner.py, shared Beam dispatch/geometry/pools, and ops/npu/unconstrained_topk.py
+    installer: vllm_gr.v1.worker.mlu.runner_installer.install
+    activation: the selected MLU provider supplies runner hooks; MLUWorker.init_device installs and verifies the standard native V2 runner lifecycle before construction
+    validator_or_test:
+      - vllm_gr.v1.worker.mlu.runner_installer.is_patched
+      - vllm_gr.v1.worker.mlu.model_runner_patch.is_patched
+    process_roles: [main, engine_core, worker]
+    target: vllm_mlu.v1.worker.gpu_worker.MLUWorker.init_device and vllm_mlu.v1.worker.gpu.model_runner.MLUModelRunner lifecycle methods
+    risk: critical
+    contract: mlu-v2-runner-lifecycle
+    removal_condition: native MLU runner integration provides GR lifecycle, Beam stage execution and retirement without these wrappers
+
+  - id: GR-PATCH-024
+    scope: backend
+    backend_id: mlu
+    owner: vllm_gr/platforms/mlu/config_patch.py
+    installer: vllm_gr.platforms.mlu.config_patch.install_mlu_config_filter
+    activation: the selected MLU provider applies runtime patches before native vendor config initialization; worker general-plugin loading reinstalls the filter in spawned processes
+    validator_or_test:
+      - vllm_gr.platforms.mlu.config_patch.is_mlu_config_filter_installed
+    process_roles: [main, engine_core, worker]
+    target: vllm_mlu.mlu_config.init_mlu_config
+    risk: medium
+    contract: mlu-additional-config-filter
+    removal_condition: native MLU config parsing accepts namespaced extension settings without interpreting them as vendor fields
+
+  - id: GR-PATCH-025
+    scope: backend
+    backend_id: mlu
+    owner: vllm_gr/platforms/mlu/config.py and engine_core_patch.py
+    installer: vllm_gr.platforms.mlu.engine_core_patch.install_mlu_engine_core_entry
+    activation: MLU configuration finalization reasserts the process entrypoint after native plugins; the spawned entry loads vendor replacements before general plugins and revalidates the GR child plan before construction
+    validator_or_test:
+      - vllm_gr.platforms.mlu.engine_core_patch.is_mlu_engine_core_entry_installed
+    process_roles: [main, engine_core]
+    target: vllm.v1.engine.core.EngineCoreProc.run_engine_core
+    risk: high
+    contract: mlu-vendor-before-gr-engine-initialization
+    removal_condition: vendor and GR initialization have an ordered native extension point that preserves the complete MLU initializer
+
+  - id: GR-PATCH-026
+    scope: backend
+    backend_id: mlu
+    owner: vllm_gr/v1/worker/mlu/numpy_staging.py
+    installer: vllm_gr.v1.worker.mlu.numpy_staging.install_numpy_staging
+    activation: deferred MLU runner installation after vendor imports and before native ModelRunner construction
+    validator_or_test:
+      - vllm_gr.v1.worker.mlu.numpy_staging.is_numpy_staging_installed
+      - vllm_gr.v1.worker.mlu.model_runner_patch.is_patched
+    process_roles: [worker]
+    target: vllm.v1.worker.gpu.buffer_utils.StagedWriteTensor.stage_write and async_tensor_h2d
+    risk: high
+    contract: mlu-numpy-staging-with-native-write-length
+    removal_condition: native MLU V2 staging supports NumPy tokens with correct write lengths and bulk transfer
+
+  - id: GR-PATCH-027
+    scope: backend
+    backend_id: mlu
+    owner: vllm_gr/platforms/mlu/scheduler_patch.py
+    shared_helpers: vllm_gr/v1/core/sched/scheduler_patch.py and beam_async_scheduler.py
+    installer: vllm_gr.platforms.mlu.scheduler_patch.install_mlu_scheduler_patch
+    activation: MLU Beam configuration finalization and spawned EngineCore entry after vendor plugins and the shared child patch plan
+    validator_or_test:
+      - vllm_gr.platforms.mlu.scheduler_patch.validate_mlu_scheduler_patch
+    process_roles: [main, engine_core]
+    target: vllm_mlu.v1.core.sched.async_scheduler.AsyncScheduler selected by native SchedulerConfig, including its _gr_admission_queue_context binding
+    risk: critical
+    contract: mlu-selected-scheduler-beam-dispatch
+    removal_condition: the selected native MLU scheduler invokes shared GR metadata and owner admission over its native queues without a provider wrapper
 
 # IDs are retained here when the installer and its legacy surface have been removed.
 retired_patches:
