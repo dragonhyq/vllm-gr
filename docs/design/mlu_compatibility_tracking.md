@@ -1166,3 +1166,24 @@ validation. For a resolved concern, record the implementation change, exact
 runtime and model configuration, verification performed, and remaining limits.
 Add new untouched callbacks as startup reaches them; do not assume this snapshot
 covers code that has not yet been imported or executed.
+
+
+## Native request slots after terminal Beam completion
+
+A completed eager Beam request previously closed its Beam buffers and reported
+`resources_released=True` without removing its native V2 request state. The
+terminal receipt replaces the scheduler retirement dispatch, so that native
+cleanup never arrived. With `max_num_seqs=32`, 32 sequential requests succeeded
+and request 33 failed with `AssertionError: No free indices`.
+
+Terminal completion now drains device work and result copies, then consumes an
+empty native scheduler output containing every native request ID before
+acknowledging release. Explicit retirement also includes native request IDs
+when they differ from the session ID, without mutating the scheduler's frame.
+
+Three host regressions cover repeated capacity reuse, retention during a
+nonterminal stage, and idempotent explicit retirement with distinct identities.
+Two failed before the fix and all three passed afterward. On the recorded
+OneRec-1.7B BF16/V2/eager run, 180 consecutive RecIF interactive requests passed
+with 32 native slots. All 32 ranked outputs for the first 32 requests matched
+their pre-fix outputs. The full benchmark remains a separate accuracy check.

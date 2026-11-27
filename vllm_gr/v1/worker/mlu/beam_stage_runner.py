@@ -411,6 +411,14 @@ class MLUEagerBeamStageRunner:
             terminal = self._terminal_result() if metadata.is_last_stage else None
             if metadata.is_last_stage:
                 self.close()
+                # The terminal receipt replaces the scheduler's retirement
+                # dispatch. Release native request slots before acknowledging
+                # completion, after device work and result copies have drained.
+                from vllm.v1.core.sched.output import SchedulerOutput
+
+                cleanup = SchedulerOutput.make_empty()
+                cleanup.finished_req_ids.update(metadata.request_ids)
+                _consume_native_state(self.worker, cleanup)
 
             from vllm.v1.outputs import ModelRunnerOutput
 
@@ -513,7 +521,9 @@ def execute_retirement(worker: Any, scheduled: Any) -> Any:
         or owner.previous.owner_generation != metadata.owner_generation
     ):
         raise RuntimeError("MLU retirement has no matching drained Beam owner")
-    _consume_native_state(worker, deepcopy(scheduled))
+    cleanup = deepcopy(scheduled)
+    cleanup.finished_req_ids.update(owner.previous.request_ids)
+    _consume_native_state(worker, cleanup)
     owner.close()
     from vllm.v1.outputs import ModelRunnerOutput
 
