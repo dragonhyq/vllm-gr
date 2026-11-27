@@ -1090,6 +1090,74 @@ recommendations. The native model forward already differs in the first QKV
 projection on identical BF16 operands. These measurements use vLLM 0.30.0
 on CUDA and 0.33.0+mlu0.17.0.pt214 on MLU.
 
+## Isolated CUDA operand replay
+
+On 2026-11-27, captured first-layer OneRec operands were replayed through
+individual CUDA and MLU operations. CUDA used H20-3e, Torch 2.13.0+cu130 and
+vLLM 0.30.0. MLU used MLU590-M9DK, Torch 2.14.0+cpu,
+torch_mlu 1.35.1+torch2.14.0 and vLLM 0.33.0+mlu0.17.0.pt214.
+The isolated CUDA QKV, residual RMSNorm and both FlashAttention 2 and 3
+outputs reproduced the captured CUDA forward exactly. The MLU replay used the
+same exported operands, verified by the fixture's SHA-256.
+
+| Operation on identical operands | Different MLU values | Total values |
+| --- | ---: | ---: |
+| Native BF16 QKV projection | 68 | 65,536 |
+| Batch-invariant BF16 QKV projection | 75 | 65,536 |
+| FP32 QKV projection cast to BF16 | 73 | 65,536 |
+| Native fused residual RMSNorm | 7,732 | 32,768 |
+| Native attention | 1,436 | 32,768 |
+| Native SiLU-and-multiply, seeded synthetic operands | 6,124 | 98,304 |
+
+Deterministic mode left the native QKV mismatch at 68 values. On CUDA,
+disabling reduced-precision BF16 reductions also left the projection identical
+to the captured reference. FP32 matrix multiplication followed by BF16 casting
+differed from the reference in 70 CUDA values and 73 MLU values.
+
+The FP64 dot product rounded directly to BF16 differed from the native CUDA
+projection in 70 values and the native MLU projection in 6 values. For example,
+at row 0, column 1148, the FP64 value was 0.00032343502243747935,
+CUDA returned 0.0003223419189453125 and MLU returned 0.000324249267578125.
+Increasing accumulation precision therefore does not reproduce the existing
+CUDA BF16 rounding decisions.
+
+Two isolated discrepancies could be removed by matching CUDA rounding points.
+Adding the residual in BF16 before native MLU RMSNorm reproduced all 32,768
+CUDA normalization values. Rounding SiLU to BF16 before multiplying by the
+up projection reproduced all 98,304 CUDA activation values in the synthetic
+fixture. Earlier temporary end-to-end experiments with explicit residual and
+activation rounding plus invariant prefill returned 14/128, 17/128 and 10/128
+matching CUDA ranks. Those experiments did not meet exact ranking acceptance.
+
+In the first CUDA decode step for the one-video prompt, 115 of the 127 adjacent
+pairs among the top 128 BF16 logits were tied. The remaining score gaps were
+0.125 or 0.25. Arithmetic changes can create or break these ties, change beam
+membership, and then change subsequent decode inputs. Replaying the complete
+CUDA logits through MLU Beam remains exact for all 384 ranked recommendations.
+
+The current native kernels fail the exact CUDA criterion. These observations
+establish a backend implementation discrepancy with matched operands. The
+framework versions also differ, so they do not establish hardware incapability.
+An experimental MLU arithmetic implementation reproduced all 65,536 first-QKV
+CUDA values. A same-shape synthetic microbenchmark measured 82.4 ms for that
+implementation and 0.019 ms for native MLU. These timings cover one projection.
+Later attention and full-model ranking remained unequal in the prototype.
+
+Exact emulation remains technically possible. A general guarantee would
+require reproducing the reference kernels' accumulation order, intermediate
+rounding, elementary functions, and shape-dependent algorithm choices across
+the forward pass, or otherwise demonstrating identical ranked outputs across
+the supported input range. A complete implementation and its serving cost
+remain unverified. The existing prefix-cache fix establishes the tested MLU
+repeatability, and exact CUDA ranking remains open.
+
+PyTorch documents floating-point differences across platforms, releases and
+batched execution. cuBLAS scopes its reproducibility guarantee to a toolkit
+version and GPUs with the same architecture and SM count. These guarantees
+do not provide cross-backend equality.
+[PyTorch numerical accuracy](https://docs.pytorch.org/docs/2.15/notes/numerical_accuracy.html),
+[cuBLAS reproducibility](https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility).
+
 ## Updating this record
 
 After each startup fix, record the new failure boundary and update only the
