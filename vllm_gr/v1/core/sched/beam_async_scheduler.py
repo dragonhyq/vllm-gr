@@ -133,13 +133,24 @@ class _AdmissionQueue:
 
 
 @contextmanager
+def _admission_queues(scheduler: Any, owner_ids: tuple[str, ...]):
+    """Filter the native queues used by the default CUDA/Ascend runtime."""
+    waiting, skipped = scheduler.waiting, scheduler.skipped_waiting
+    try:
+        scheduler.waiting = _AdmissionQueue(waiting, owner_ids)
+        scheduler.skipped_waiting = _AdmissionQueue(skipped, owner_ids)
+        yield
+    finally:
+        scheduler.waiting, scheduler.skipped_waiting = waiting, skipped
+
+
+@contextmanager
 def gr_admission(scheduler: Any):
     """Gate native selection and reserve the full logical KV extent on first allocation."""
     owner = _admit_owner(scheduler)
     if owner is None:
         yield
         return
-    waiting, skipped = scheduler.waiting, scheduler.skipped_waiting
     budget = scheduler.max_num_scheduled_tokens
     manager = scheduler.kv_cache_manager
     allocate = manager.allocate_slots
@@ -160,17 +171,23 @@ def gr_admission(scheduler: Any):
             )
         return result
 
-    scheduler.waiting = _AdmissionQueue(waiting, owner_ids)
-    scheduler.skipped_waiting = _AdmissionQueue(skipped, owner_ids)
-    manager.allocate_slots = reserve
-    if not can_issue_gr_stage(scheduler, owner):
-        scheduler.max_num_scheduled_tokens = 0
-    try:
-        yield
-    finally:
-        scheduler.waiting, scheduler.skipped_waiting = waiting, skipped
-        scheduler.max_num_scheduled_tokens = budget
-        manager.allocate_slots = allocate
+    # Providers with a different native queue layout supply only the queue
+    # context. Execution ownership, KV reservation and stage gating stay shared.
+    queue_context = getattr(scheduler, "_gr_admission_queue_context", None)
+    queues = (
+        queue_context(owner_ids)
+        if queue_context is not None
+        else _admission_queues(scheduler, owner_ids)
+    )
+    with queues:
+        manager.allocate_slots = reserve
+        try:
+            if not can_issue_gr_stage(scheduler, owner):
+                scheduler.max_num_scheduled_tokens = 0
+            yield
+        finally:
+            scheduler.max_num_scheduled_tokens = budget
+            manager.allocate_slots = allocate
 
 
 def _drain_resources(scheduler: Any, session: GRSessionState) -> None:

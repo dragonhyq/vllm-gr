@@ -26,9 +26,12 @@ def _device_type(config: Any, *, default: str | None = None) -> str | None:
 def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Check execution support without importing a device runtime."""
     device = _device_type(config)
-    if device not in (None, "cuda", "npu"):
+    # MLU admission is provisional while its Beam runner execution is ported.
+    # The provider requires V2; the runner still rejects unimplemented stages.
+    if device not in (None, "cuda", "npu", "mlu"):
         raise ValueError(
-            "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
+            "Asynchronous scheduling requires a CUDA ModelRunner, "
+            "NPU ModelRunner V1, or MLU ModelRunner V2"
         )
     gr_config = GRConfig.from_vllm_config(config)
     if gr_config.beam_sid_stage_vocab and device != "npu":
@@ -73,8 +76,9 @@ def validate_frontend_constraint_mode(
 ) -> None:
     device = _device_type(config, default="cuda")
     if configured_constraint_mode(gr_config) is ConstraintMode.NONE:
-        if device not in ("cuda", "npu"):
-            raise ValueError("unconstrained beam_search requires CUDA or NPU")
+        # Match provisional MLU worker admission; Beam stage guards still apply.
+        if device not in ("cuda", "npu", "mlu"):
+            raise ValueError("unconstrained beam_search requires CUDA, NPU or MLU")
         return
 
     table = runtime_constraint_table(gr_config)

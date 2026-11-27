@@ -19,6 +19,8 @@ logger = logging.getLogger("vllm_gr.platforms.compat")
 SUPPORTED_VLLM_VERSION = "0.30.0"
 SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
 SUPPORTED_TRITON_ASCEND_VERSION = "3.6.0"
+# The MLU runtime pin covers activation only; GR execution is not implemented.
+SUPPORTED_VLLM_MLU_VERSION = "0.33.0"
 
 #: When set to a truthy value, an unsatisfied declared range is a hard failure.
 #: The default only warns: whether a declared range still holds is a vendor

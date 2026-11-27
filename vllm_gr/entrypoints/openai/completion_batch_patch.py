@@ -217,6 +217,11 @@ async def _create_completion_batched(
         )
     # One logical batch runs under the request id the caller already sees, so
     # the single-session case keeps the identifiers it had before this patch.
+    from vllm.platforms import current_platform
+
+    priority_kwargs = {}
+    if current_platform.device_type == "mlu":
+        priority_kwargs["priority"] = self._get_priority(request, raw_request)
     generator = self.beam_search(
         prompt=engine_inputs,
         request_id=request_id,
@@ -225,6 +230,7 @@ async def _create_completion_batched(
         trace_headers=trace_headers,
         session_id=self._get_session_id(request, raw_request),
         trie_ids=(getattr(request, "vllm_xargs", None) or {}).get("trie_ids"),
+        **priority_kwargs,
     )
     try:
         async with aclosing(generator):

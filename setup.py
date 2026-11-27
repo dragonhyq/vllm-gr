@@ -5,7 +5,7 @@ Setup script for vllm-gr with hardware-dependent installation.
 
 This setup.py implements platform-aware dependency routing so users can run
 `pip install vllm-gr` and automatically receive the correct platform-specific
-dependencies (CUDA/NPU/CPU) without requiring extras like `[gpu]`.
+dependencies (CUDA/NPU/MLU/CPU) without requiring extras like `[gpu]`.
 """
 
 import logging
@@ -22,7 +22,7 @@ from setuptools_scm import get_version
 
 logger = logging.getLogger("vllm_gr.setup")
 
-_VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
+_VALID_DEVICES = frozenset(("cuda", "npu", "mlu", "cpu"))
 VLLM_GR_BASE_VERSION = "0.30.0"
 ROOT_DIR = Path(__file__).resolve().parent
 _SCM_OVERRIDE = "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR"
@@ -116,6 +116,7 @@ def get_vllm_gr_version() -> str:
     Version format examples:
         - 0.30.0 (cuda, no suffix)
         - 0.30.0+npu
+        - 0.30.0+mlu
         - 0.30.0+cpu
 
     Environment variables:
@@ -145,7 +146,7 @@ def get_vllm_gr_version() -> str:
 
         if device == "cuda":
             pass
-        elif device in ("npu", "cpu"):
+        elif device in ("npu", "mlu", "cpu"):
             sep = "+" if "+" not in version else "."
             version += f"{sep}{device}"
         else:

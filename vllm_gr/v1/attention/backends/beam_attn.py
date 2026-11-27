@@ -5,7 +5,7 @@
 """Beam attention over a shared paged prefix and persistent per-beam suffix KV."""
 
 from functools import cached_property
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 from vllm import envs
@@ -14,7 +14,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -33,6 +32,14 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 from vllm_gr.v1.attention.backends.beam_attn_metadata_tensors import (
     _get_fp8_dtype_for_flashattn,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
+if current_platform.device_type == "mlu":
+    from vllm.v1.kv_cache_interface import is_quantized_kv_cache
+else:
+    from vllm.utils.torch_utils import is_quantized_kv_cache
 
 __all__ = [
     "BeamAttentionBackend",
@@ -205,6 +212,10 @@ class BeamAttentionImpl(AttentionImpl):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if isinstance(kv_cache, tuple):
             return kv_cache
+        if current_platform.device_type == "mlu":
+            from vllm_gr.v1.attention.backends.beam_attn_mlu import kv_cache_views
+
+            return kv_cache_views(kv_cache, self.head_size)
         # vLLM 0.30 allocates a logical [B, H, N, K+V] view, with
         # layout-dependent strides. The kernels consume [B, N, H, D]
         # views into that same allocation, including interleaved layers.
@@ -371,7 +382,9 @@ class BeamAttentionImpl(AttentionImpl):
                 self.vllm_flash_attn_version,
             )
         # The fused suffix consumes model-dtype queries, not quantized Q.
-        self.supports_quant_query_input = not short_suffix_attention
+        self.supports_quant_query_input = (
+            not short_suffix_attention and current_platform.device_type != "mlu"
+        )
         self.use_cascade = True
 
     def _prefill_cascade_kwargs(self) -> dict[str, int]:
@@ -706,7 +719,15 @@ class BeamAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
+        if current_platform.device_type == "mlu":
+            from vllm_mlu.v1.attention.backends.tmo_flash_attn import (
+                TMOFlashAttentionBackend,
+            )
+
+            return TMOFlashAttentionBackend.get_supported_kernel_block_sizes(kv_cache_spec)
         return [MultipleOf(16)]
 
     @classmethod
@@ -765,6 +786,8 @@ class BeamAttentionBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        if current_platform.device_type == "mlu":
+            return (KVCacheLayout.LBHNC,)
         # Cache writes and paged prefix FlashAttention consume strides.
         # Prefer token-major storage, matching the former NHD default.
         return (

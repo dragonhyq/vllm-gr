@@ -45,6 +45,7 @@ async def beam_search(
     session_id: str | None = None,
     *,
     trie_ids: list[int] | tuple[int, ...] | None = None,
+    priority: int | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
     """Submit one online V1 request and yield terminal outputs only.
 
@@ -82,7 +83,8 @@ async def beam_search(
     params = copy(params)
     params.ignore_eos = True
 
-    priority = int(time.perf_counter() * 1_000_000)
+    if priority is None:
+        priority = int(time.perf_counter() * 1_000_000)
     rank = await _next_data_parallel_rank(self.engine_client)
 
     call = OnlineBeamSearchRequest(

@@ -70,8 +70,14 @@ def _gr_main(argv: list[str]) -> None:
     from vllm_gr.engine.startup import configure_model_runner_default
 
     configure_model_runner_default()
-    from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
+    from vllm.platforms import current_platform
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    if current_platform.device_type == "mlu":
+        # The MLU runtime uses vLLM 0.33, which moved the CLI startup helpers.
+        from vllm.entrypoints.common.startup import cli_env_setup
+    else:
+        from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
 
     cli_env_setup()
     command = argv[0] if argv and argv[0] in COMMANDS else None

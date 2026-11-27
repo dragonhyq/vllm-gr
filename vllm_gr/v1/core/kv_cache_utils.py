@@ -198,9 +198,7 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
     # Same constant-time FIFO rationale as the per-block memo above.
     chain_memo: OrderedDict[tuple, list] = OrderedDict()
 
-    def get_request_block_hasher_memo(block_size, caching_hash_fn):
-        original_hasher = original_factory(block_size, caching_hash_fn)
-
+    def make_chain_memo_hasher(block_size, caching_hash_fn, original_hasher):
         def request_block_hasher_chain_memo(request):
             global _CHAIN_FALLBACK_ACTIVE
             if (
@@ -258,10 +256,34 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
 
         return request_block_hasher_chain_memo
 
-    get_request_block_hasher_memo._gr_chain_memo = True  # type: ignore[attr-defined]
+    def get_request_block_hasher_memo(block_size, caching_hash_fn):
+        original_hasher = original_factory(block_size, caching_hash_fn)
+        return make_chain_memo_hasher(block_size, caching_hash_fn, original_hasher)
+
+    from vllm.platforms import current_platform
+
+    factory = get_request_block_hasher_memo
+    if current_platform.device_type == "mlu":
+
+        def get_request_block_hasher_memo_mlu(
+            block_size, caching_hash_fn, num_hash_lookahead_tokens: int = 0
+        ):
+            original_hasher = original_factory(
+                block_size, caching_hash_fn, num_hash_lookahead_tokens
+            )
+            if num_hash_lookahead_tokens != 0:
+                # The whole-chain memo omits trailing lookahead tokens and
+                # their extra keys. Native hashing must retain both, as well
+                # as delaying a block's hash until its lookahead is available.
+                return original_hasher
+            return make_chain_memo_hasher(block_size, caching_hash_fn, original_hasher)
+
+        factory = get_request_block_hasher_memo_mlu
+
+    factory._gr_chain_memo = True  # type: ignore[attr-defined]
     # Exposed for tests / diagnostics: the live chain-memo store.
-    get_request_block_hasher_memo._gr_chain_memo_entries = chain_memo  # type: ignore[attr-defined]
-    kv_cache_utils.get_request_block_hasher = get_request_block_hasher_memo
+    factory._gr_chain_memo_entries = chain_memo  # type: ignore[attr-defined]
+    kv_cache_utils.get_request_block_hasher = factory
 
 
 def validate_kv_hash_memo_patch() -> str | None:

@@ -50,18 +50,45 @@ def apply_custom_attention_backend_patch(force: bool = False) -> int:
     if _ORIGINAL_ATTR in getattr(original, "__dict__", {}):
         return 0
 
-    def _patched_cached_get_attn_backend(
+    def _select_backend(
         backend: Any,
         attn_selector_config: Any,
-        num_heads: int | None = None,
+        num_heads: int | None,
+        **native_kwargs: Any,
     ) -> Any:
         # Preserve the original CUSTOM import error rather than hiding it.
         if backend == AttentionBackendEnum.CUSTOM:
             return _get_custom_beam_backend()
         if backend is None and _get_current_gr_attention_backend() is GRAttentionBackend.CUSTOM:
             return _get_custom_beam_backend()
-        return original(backend, attn_selector_config, num_heads=num_heads)
+        return original(backend, attn_selector_config, num_heads=num_heads, **native_kwargs)
 
-    setattr(_patched_cached_get_attn_backend, _ORIGINAL_ATTR, original)
-    selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
+    def _patched_cached_get_attn_backend(
+        backend: Any,
+        attn_selector_config: Any,
+        num_heads: int | None = None,
+    ) -> Any:
+        return _select_backend(backend, attn_selector_config, num_heads)
+
+    def _patched_mlu_cached_get_attn_backend(
+        backend: Any,
+        attn_selector_config: Any,
+        num_heads: int | None = None,
+        *,
+        _run_kv_cache_dtype: str | None = None,
+    ) -> Any:
+        # vLLM 0.33 includes the run-wide dtype in the native selector cache key.
+        return _select_backend(
+            backend, attn_selector_config, num_heads, _run_kv_cache_dtype=_run_kv_cache_dtype
+        )
+
+    from vllm.platforms import current_platform
+
+    patched = (
+        _patched_mlu_cached_get_attn_backend
+        if current_platform.device_type == "mlu"
+        else _patched_cached_get_attn_backend
+    )
+    setattr(patched, _ORIGINAL_ATTR, original)
+    selector_mod._cached_get_attn_backend = patched
     return 1
