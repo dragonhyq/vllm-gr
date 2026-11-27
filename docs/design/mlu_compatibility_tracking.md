@@ -1,5 +1,9 @@
 # MLU compatibility tracking
 
+For the later 2026-11-27 recommendation-quality and mathematical checks, see
+[MLU OneRec quality validation](mlu_onerec_quality.md). The entries below retain
+their original revision and scope.
+
 This document tracks unchanged GR integration code that startup has reached on
 the MLU vLLM 0.33 runtime, but whose runtime behavior still needs validation.
 It also records known deferred incompatibilities and the current startup
@@ -1166,7 +1170,6 @@ validation. For a resolved concern, record the implementation change, exact
 runtime and model configuration, verification performed, and remaining limits.
 Add new untouched callbacks as startup reaches them; do not assume this snapshot
 covers code that has not yet been imported or executed.
-
 
 ## Native request slots after terminal Beam completion
 
